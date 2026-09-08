@@ -366,6 +366,10 @@ function prettyWhen(p) {
 
 // --------------------------------------------------------------- alerting ---
 
+/**
+ * Registro de un hallazgo: consola + hits.log. Siempre por función, aunque el
+ * aviso después se agrupe.
+ */
 function announce(p, url, prev, o, seatInfo) {
   const seatTxt = seatInfo
     ? seatInfo.runs.map((r) => r.seats.map((s) => s.id).join('+')).join('  |  ')
@@ -389,28 +393,90 @@ function announce(p, url, prev, o, seatInfo) {
   console.log(`  ${C.cyan(url)}`);
   console.log('');
 
+}
+
+/**
+ * Consejo sobre las butacas encontradas. Sólo aplica cuando se leyó el mapa
+ * (etapa 2) y la función es IMAX: el número de fila que menciona es de esa sala.
+ */
+const NOTA_IMAX = 'Butacas aceptables para IMAX, igual intentaría sacar de la fila H para arriba.';
+
+function notaButacas(hits) {
+  const aplica = hits.some((h) => h.seatInfo && /imax/i.test(h.p.format || ''));
+  return aplica ? NOTA_IMAX : null;
+}
+
+/** Un solo hallazgo: el aviso puede ser específico. */
+function alertHit({ p, url, seatInfo }, o) {
   const best = seatInfo ? seatInfo.runs[0].seats.map((s) => s.id).join(' + ') : null;
   const when = prettyWhen(p);
 
   const channels = [...o.channels];
   if (o.open && !channels.includes('open')) channels.push('open');
 
-  // La fecha va en el cuerpo, no sólo en el subtítulo: el diálogo no muestra
-  // subtítulo, así que ahí se perdía.
+  // La fecha va sólo en `subtitle`: alert.js la pone arriba en los dos canales
+  // (banner y ventana), así que repetirla en el cuerpo la mostraba dos veces.
   //
   // Cine y formato sólo se muestran si estás mirando más de uno; con --imax
   // son siempre los mismos y no aportan nada al aviso.
-  const lines = [when];
-  if (o.showVenue) lines.push(`${p.cinemaName} · ${p.format}`);
-  lines.push(best ? `Butacas ${best}  ·  fila ${seatInfo.runs[0].row}` : 'Ya no está agotada');
+  const detail = [];
+  if (o.showVenue) detail.push(`${p.cinemaName} · ${p.format}`);
+  detail.push(best ? `Butacas ${best} · fila ${seatInfo.runs[0].row}` : 'Ya no está agotada');
+  const nota = notaButacas([{ p, seatInfo }]);
+  if (nota) detail.push(nota);
 
   alerts.fire(channels, {
-    title: `🎟️  ${p.filmName} — hay lugar`,
+    title: `🎟 ${p.filmName} — hay lugar`,
     subtitle: when,
-    message: lines.join('\n'),
+    detail,
     speech: `${p.filmName}, ${when.replace('·', 'a las')}.` +
       (best ? ` Butacas ${best.replace(/-/g, ' ')}.` : ''),
     url,
+    repeat: 3,
+  });
+}
+
+/**
+ * Varios hallazgos en el mismo ciclo: UN aviso con la lista, no uno por función.
+ *
+ * Pasa siempre en el primer ciclo (que avisa de todo lo que ya está bien) y en
+ * los recordatorios de `--remind-every`. Con el canal `dialog` eso eran siete
+ * ventanas modales apiladas cuando el bot arrancaba, que además de molesto hacía
+ * que el aviso importante se perdiera entre las otras seis.
+ *
+ * `open` abre sólo la primera: siete pestañas de navegador tampoco sirven.
+ */
+function alertHits(hits, o) {
+  if (hits.length === 1) return alertHit(hits[0], o);
+
+  const channels = [...o.channels];
+  if (o.open && !channels.includes('open')) channels.push('open');
+
+  const seatTxt = ({ seatInfo }) => (seatInfo
+    ? ` — butacas ${seatInfo.runs[0].seats.map((s) => s.id).join(' + ')}`
+    : '');
+  const shown = hits.slice(0, 6).map((h) => `${prettyWhen(h.p)}${seatTxt(h)}`);
+  if (hits.length > 6) shown.push(`…y ${hits.length - 6} más`);
+
+  // `rows` es la lista elegible: cada fila abre SU función. `detail` es el mismo
+  // contenido en texto plano, para el banner y la voz, que no tienen lista.
+  const rows = hits.map((h) => ({
+    label: `${prettyWhen(h.p)}${o.showVenue ? `  ·  ${h.p.cinemaName}` : ''}` +
+      `${seatTxt(h)}`,
+    url: h.url,
+  }));
+
+  // La nota va en el prompt (arriba de la lista) y no en cada fila: es el mismo
+  // consejo para todas y repetirlo siete veces sólo ensucia.
+  const nota = notaButacas(hits);
+
+  alerts.fire(channels, {
+    title: `🎟 ${hits[0].p.filmName} — ${hits.length} funciones con lugar`,
+    subtitle: ['Elegí cuál querés ver:', nota].filter(Boolean).join('\n'),
+    detail: nota ? [...shown, nota] : shown,
+    rows,
+    speech: `Hay ${hits.length} funciones con lugar para ${hits[0].p.filmName}.`,
+    url: hits[0].url,
     repeat: 3,
   });
 }
@@ -435,10 +501,20 @@ function announceNew(fresh, filmName, o) {
     o.showVenue ? `${prettyWhen(p)}  —  ${p.cinemaName}` : prettyWhen(p));
   if (fresh.length > 6) shown.push(`…y ${fresh.length - 6} más`);
 
+  // Igual que los hallazgos: si son varias, la lista es elegible y cada fila
+  // abre su función.
+  const rows = fresh.map((p) => ({
+    label: `${prettyWhen(p)}${o.showVenue ? `  ·  ${p.cinemaName}` : ''}`,
+    url: bookingUrl(o.film, p),
+  }));
+
   alerts.fire(o.channels, {
-    title: `🆕  ${filmName} — ${fresh.length} función(es) nueva(s)`,
-    subtitle: prettyWhen(first),
-    message: shown.join('\n'),
+    title: `🆕 ${filmName} — ${fresh.length} función(es) nueva(s)`,
+    subtitle: fresh.length > 1
+      ? 'Salieron a la venta. Elegí cuál querés ver:'
+      : prettyWhen(first),
+    detail: shown,
+    rows,
     speech: `Salieron ${fresh.length} funciones nuevas de ${filmName}. ` +
       `La primera, ${prettyWhen(first).replace('·', 'a las')}.`,
     url: bookingUrl(o.film, first),
@@ -554,9 +630,10 @@ async function cycle(o, state, cycleNum) {
           // Corriendo de fondo nadie mira la consola: hay que avisar fuerte,
           // si no el bot queda medio ciego durante días sin que te enteres.
           alerts.fire(o.channels, {
-            title: '⚠️  voyalcine-bot — sesión vencida',
-            subtitle: 'El chequeo de butacas quedó desactivado',
-            message: `Actualizá la cookie en ${CONFIG_FILE} y reiniciá el bot.`,
+            title: '⚠️ VoyAlCine — la sesión venció',
+            subtitle: 'El chequeo de butacas quedó apagado',
+            detail: ['Sigo avisando cuando una función deja de estar agotada.',
+              'Para volver a mirar butacas: abrí el menú ./cine → Ajustes.'],
             speech: 'La sesión de voyalcine venció. El chequeo de butacas está desactivado.',
             repeat: 2,
           });
@@ -573,6 +650,7 @@ async function cycle(o, state, cycleNum) {
   const goal = o.seats > 0 && session ? SEATS_OK : AVAILABLE;
 
   const hits = [];
+  const porAvisar = [];   // se avisa junto al final del ciclo, no de a uno
   const tally = {};
   for (const r of results) {
     tally[r.status] = (tally[r.status] || 0) + 1;
@@ -585,8 +663,10 @@ async function cycle(o, state, cycleNum) {
     const isNew = prev !== goal;
     const remind = o.remindEvery > 0 && cycleNum % o.remindEvery === 0;
     if (r.status === goal && (isNew || cycleNum === 1 || remind)) {
-      announce(r.p, bookingUrl(o.film, r.p), prev, o, seatOf.get(r.p.perfId));
+      const url = bookingUrl(o.film, r.p);
+      announce(r.p, url, prev, o, seatOf.get(r.p.perfId));
       hits.push(r);
+      porAvisar.push({ p: r.p, url, seatInfo: seatOf.get(r.p.perfId) });
     } else if (!o.quiet && prev && prev !== r.status) {
       console.log(C.dim(`  ~ ${label(r.p)}: ${prev} → ${r.status}` +
         (r.status === SEATS_NO && r.detail ? ` (${r.detail})` : '')));
@@ -601,6 +681,8 @@ async function cycle(o, state, cycleNum) {
     };
   }
   saveState(state);
+
+  if (porAvisar.length) alertHits(porAvisar, o);
 
   const summary = Object.entries(tally)
     .map(([k, v]) => {

@@ -1,0 +1,688 @@
+#!/bin/bash
+#
+# VoyAlCine — menú único. Es lo único que hace falta abrir.
+#
+#   ./cine                menú
+#   ./cine on             activar
+#   ./cine off            desactivar
+#   ./cine estado         ver si está vigilando
+#   ./cine probar         disparar un aviso de prueba
+#   ./cine borrar-todo    sacar todo de la computadora
+#
+# Todo lo que se puede tocar vive en ajustes.conf; el daemon lo maneja
+# install-daemon.sh. Este archivo es sólo la cara visible.
+
+set -uo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+CONF="$DIR/ajustes.conf"
+LABEL="net.voyalcine.bot"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$DIR/watch.out"
+ATAJO="$HOME/Desktop/VoyAlCine.command"
+CACHE_PELIS=""
+
+# --------------------------------------------------------------- apariencia ---
+
+if [ -t 1 ]; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[0m'
+  VERDE=$'\e[32m'; ROJO=$'\e[31m'; AMAR=$'\e[33m'; CIAN=$'\e[36m'
+else
+  B=""; D=""; R=""; VERDE=""; ROJO=""; AMAR=""; CIAN=""
+fi
+
+# Sin marco cerrado a propósito: el ancho del emoji cambia según la terminal y
+# el borde derecho quedaba corrido. Una línea abajo no se puede desalinear.
+titulo() {
+  clear 2>/dev/null || true
+  printf '\n  %s🎟  VoyAlCine%s  %s·  te aviso cuando hay lugar%s\n' "$B" "$R" "$D" "$R"
+  printf '  %s────────────────────────────────────────────%s\n\n' "$CIAN" "$R"
+}
+
+ok()    { printf '  %s✓%s %s\n' "$VERDE" "$R" "$1"; }
+mal()   { printf '  %s✗%s %s\n' "$ROJO" "$R" "$1"; }
+aviso() { printf '  %s!%s %s\n' "$AMAR" "$R" "$1"; }
+info()  { printf '  %s\n' "$1"; }
+gris()  { printf '  %s%s%s\n' "$D" "$1" "$R"; }
+
+pausa() {
+  printf '\n  %sEnter para volver al menú%s ' "$D" "$R"
+  read -r _ || true
+}
+
+# Pregunta sí/no. Enter = el default que le pases ("s" o "n").
+confirmar() {
+  local q="$1" def="${2:-s}" ans
+  local hint="[S/n]"; [ "$def" = "n" ] && hint="[s/N]"
+  printf '  %s %s ' "$q" "$hint"
+  read -r ans || ans=""
+  ans="${ans:-$def}"
+  [[ "$ans" =~ ^[sSyY] ]]
+}
+
+# --------------------------------------------------------------- requisitos ---
+
+# Node es el único requisito real. Si falta, no hay nada que hacer más que
+# explicarlo en castellano y ofrecer abrir la página de descarga.
+verificar_node() {
+  if command -v node >/dev/null 2>&1; then
+    local v; v="$(node -v | tr -d 'v' | cut -d. -f1)"
+    if [ "${v:-0}" -ge 18 ] 2>/dev/null; then return 0; fi
+    titulo
+    mal "Tenés Node $(node -v), y hace falta 18 o más nuevo."
+    info ""
+    info "Instalá la versión actual desde nodejs.org (es gratis y seguro):"
+    info "bajá el instalador para macOS y hacele doble clic."
+    info ""
+    confirmar "¿Abro la página de descarga?" s && open "https://nodejs.org/es" 2>/dev/null
+    echo; exit 1
+  fi
+  titulo
+  mal "Falta Node.js, que es el motor que necesita este programa."
+  info ""
+  info "Es gratis, lo hace una fundación y no toca nada de tu Mac:"
+  info "  1. Se abre nodejs.org"
+  info "  2. Bajá el instalador para macOS (el botón grande)"
+  info "  3. Doble clic, Siguiente hasta el final"
+  info "  4. Volvé a abrir este programa"
+  info ""
+  confirmar "¿Abro la página de descarga?" s && open "https://nodejs.org/es" 2>/dev/null
+  echo; exit 1
+}
+
+# ------------------------------------------------------------------ ajustes ---
+
+cargar() {
+  FILM=5875; FILM_NAME=""; SOLO_IMAX=0; FORMAT=""; CINEMAS=""
+  CINEMA_NAME=""
+  INTERVAL=300; ALERT="bell,sound,dialog"
+  SEATS=0; ROWS=""; ZONE=""; PRICE=""
+  # shellcheck source=/dev/null
+  [ -f "$CONF" ] && . "$CONF"
+}
+
+guardar() {
+  cat > "$CONF" <<CONF_EOF
+# Escrito por ./cine — podés editarlo a mano si sabés lo que hacés.
+FILM=$FILM
+FILM_NAME="$FILM_NAME"
+SOLO_IMAX=$SOLO_IMAX
+FORMAT="$FORMAT"
+CINEMAS="$CINEMAS"
+CINEMA_NAME="$CINEMA_NAME"
+INTERVAL=$INTERVAL
+ALERT="$ALERT"
+SEATS=$SEATS
+ROWS="$ROWS"
+ZONE="$ZONE"
+PRICE="$PRICE"
+CONF_EOF
+}
+
+# Ajustes en castellano, para mostrar en el menú.
+describir_filtro() {
+  local t=""
+  [ "$SOLO_IMAX" = "1" ] && t="solo funciones IMAX"
+  [ -n "$FORMAT" ] && t="${t:+$t · }formato: $FORMAT"
+  [ -n "$CINEMAS" ] && t="${t:+$t · }${CINEMA_NAME:-cines $CINEMAS}"
+  [ -z "$t" ] && t="todas las funciones"
+  printf '%s · reviso cada %s min' "$t" "$((INTERVAL / 60))"
+}
+
+describir_avisos() {
+  local t=""
+  case ",$ALERT," in *,dialog,*) t="ventana en pantalla";; esac
+  case ",$ALERT," in *,notify,*) t="${t:+$t + }globo de notificación";; esac
+  case ",$ALERT," in *,sound,*)  t="${t:+$t + }sonido";; esac
+  case ",$ALERT," in *,say,*)    t="${t:+$t + }voz";; esac
+  case ",$ALERT," in *,open,*)   t="${t:+$t + }abre el navegador";; esac
+  printf '%s' "${t:-sin avisos}"
+}
+
+# -------------------------------------------------------------------- estado ---
+
+esta_activo() { launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------ elegir película ---
+
+# Trae la lista una vez por ejecución: son 43 nombres, no vale pedirla dos veces.
+bajar_peliculas() {
+  [ -n "$CACHE_PELIS" ] && [ -f "$CACHE_PELIS" ] && return 0
+  CACHE_PELIS="$(mktemp -t voyalcine-pelis)"
+  printf '  %sBuscando las películas en cartel…%s' "$D" "$R" >&2
+  if ! node peliculas.js list > "$CACHE_PELIS" 2>/dev/null || [ ! -s "$CACHE_PELIS" ]; then
+    printf '\r\033[K' >&2
+    mal "No pude conectarme a voyalcine.net." >&2
+    gris "Revisá que tengas internet y probá de nuevo." >&2
+    rm -f "$CACHE_PELIS"; CACHE_PELIS=""
+    return 1
+  fi
+  printf '\r\033[K' >&2
+}
+
+# Deja elegida FILM/FILM_NAME. Devuelve 1 si el usuario se arrepintió.
+elegir_pelicula() {
+  bajar_peliculas || return 1
+  local busq matches n sel
+
+  while :; do
+    printf '\n  %s¿Qué película querés vigilar?%s\n\n' "$B" "$R"
+    gris "Escribí parte del nombre (ej: odisea) y Enter."
+    gris "Enter sin nada = ver toda la cartelera. Escribí x para cancelar."
+    printf '\n  > '
+    read -r busq || return 1
+    [ "$busq" = "x" ] && return 1
+
+    matches="$(mktemp -t voyalcine-match)"
+    if [ -z "$busq" ]; then
+      cp "$CACHE_PELIS" "$matches"
+    else
+      # -i: sin acentos ni mayúsculas de por medio en lo que escribió
+      grep -i -- "$busq" "$CACHE_PELIS" > "$matches" 2>/dev/null || true
+    fi
+
+    n="$(wc -l < "$matches" | tr -d ' ')"
+    if [ "$n" = "0" ]; then
+      printf '\n'; aviso "Ninguna película se llama así. Probá con menos letras."
+      rm -f "$matches"; continue
+    fi
+
+    printf '\n'
+    awk -F'\t' -v b="$B" -v r="$R" -v d="$D" \
+      '{ printf "   %s%2d%s  %s  %s(%s)%s\n", b, NR, r, $2, d, $1, r }' "$matches"
+    printf '\n  %sElegí el número%s (Enter para buscar de nuevo): ' "$B" "$R"
+    read -r sel || { rm -f "$matches"; return 1; }
+
+    if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$n" ]; then
+      FILM="$(sed -n "${sel}p" "$matches" | cut -f1)"
+      FILM_NAME="$(sed -n "${sel}p" "$matches" | cut -f2)"
+      rm -f "$matches"
+      return 0
+    fi
+    rm -f "$matches"
+  done
+}
+
+# Deja elegido CINEMAS (ids separados por coma; vacío = todos). Recibe la línea
+# "id:nombre | id:nombre" que imprime peliculas.js.
+#
+# Sin filtro de cine son ~190 funciones por ciclo en 8 cines de todo el país,
+# que además de inútil es pegarle al sitio 8 veces más de lo necesario.
+elegir_cine() {
+  local lista="$1"
+  [ -z "$lista" ] && { CINEMAS=""; return 0; }
+
+  local tmp; tmp="$(mktemp -t voyalcine-cines)"
+  printf '%s\n' "$lista" | tr '|' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' > "$tmp"
+  local n; n="$(wc -l < "$tmp" | tr -d ' ')"
+
+  if [ "$n" -le 1 ]; then CINEMAS=""; rm -f "$tmp"; return 0; fi
+
+  printf '\n  %s¿En qué cine?%s\n\n' "$B" "$R"
+  awk -F: -v b="$B" -v r="$R" '{ printf "   %s%2d%s  %s\n", b, NR, r, $2 }' "$tmp"
+  printf '   %s %d%s  En cualquiera %s(más lento y avisa de cines lejanos)%s\n' "$B" "$((n + 1))" "$R" "$D" "$R"
+  printf '\n  Elegí el número: '
+  local sel; read -r sel || sel=""
+
+  if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$n" ]; then
+    CINEMAS="$(sed -n "${sel}p" "$tmp" | cut -d: -f1)"
+    CINEMA_NAME="$(sed -n "${sel}p" "$tmp" | cut -d: -f2-)"
+  else
+    CINEMAS=""; CINEMA_NAME=""
+  fi
+  rm -f "$tmp"
+}
+
+# ------------------------------------------------------------------- wizard ---
+
+# Primera vez: 3 preguntas y listo. Todo lo demás tiene un default que sirve.
+configurar() {
+  titulo
+  printf '  %sVamos a configurarlo en un minuto.%s\n' "$B" "$R"
+
+  elegir_pelicula || return 1
+
+  # Qué hay a la venta de esa película: define qué preguntas tienen sentido.
+  printf '\n  %sViendo qué funciones tiene…%s' "$D" "$R"
+  local datos; datos="$(node peliculas.js info "$FILM" 2>/dev/null)"
+  printf '\r\033[K'
+
+  local IMAX=0 PERFS=0 NCINEMAS=0 FIRST="" NAME=""
+  eval "$(printf '%s\n' "$datos" | grep -E '^(IMAX|PERFS|NCINEMAS)=' )" 2>/dev/null || true
+  FIRST="$(printf '%s\n' "$datos" | sed -n 's/^FIRST=//p')"
+  NAME="$(printf '%s\n' "$datos" | sed -n 's/^NAME=//p')"
+  [ -n "$NAME" ] && FILM_NAME="$NAME"
+
+  printf '\n'
+  ok "Elegiste: ${B}${FILM_NAME}${R}"
+  if [ "${PERFS:-0}" -gt 0 ]; then
+    gris "Hay $PERFS funciones a la venta en $NCINEMAS cines. La primera: $FIRST"
+  else
+    aviso "Ahora mismo no tiene funciones a la venta."
+    gris "Igual sirve: te aviso en cuanto salgan a la venta."
+  fi
+
+  # IMAX sólo se pregunta si esta película tiene IMAX.
+  SOLO_IMAX=0
+  if [ "${IMAX:-0}" = "1" ]; then
+    printf '\n'
+    if confirmar "¿Te interesa SOLO la función IMAX?" n; then SOLO_IMAX=1; fi
+  fi
+
+  # Con IMAX ya queda un solo cine, así que no vale la pena preguntar.
+  CINEMAS=""; CINEMA_NAME=""
+  if [ "$SOLO_IMAX" != "1" ]; then
+    elegir_cine "$(printf '%s\n' "$datos" | sed -n 's/^CINEMAS=//p')"
+  fi
+
+  # Avisos: la ventana siempre se ve, el globo depende de un permiso de macOS.
+  printf '\n  %s¿Cómo querés que te avise?%s\n\n' "$B" "$R"
+  printf '   %s1%s  Ventana en pantalla + sonido   %s(recomendado, no falla nunca)%s\n' "$B" "$R" "$D" "$R"
+  printf '   %s2%s  Igual que 1, y además me lo dice en voz alta\n' "$B" "$R"
+  printf '   %s3%s  Ventana + sonido + abre el navegador solo en la función\n' "$B" "$R"
+  printf '\n  Elegí (Enter = 1): '
+  local a; read -r a || a=""
+  case "${a:-1}" in
+    2) ALERT="bell,sound,dialog,say" ;;
+    3) ALERT="bell,sound,dialog,open" ;;
+    *) ALERT="bell,sound,dialog" ;;
+  esac
+
+  INTERVAL=300
+  SEATS=0; ROWS=""; ZONE=""; PRICE=""
+  guardar
+
+  printf '\n'
+  ok "Guardado."
+  gris "Película: $FILM_NAME · $(describir_filtro)"
+  gris "Avisos: $(describir_avisos)"
+
+  crear_atajo
+
+  printf '\n'
+  if confirmar "¿Lo activo ahora?" s; then activar; fi
+  return 0
+}
+
+# Doble clic en el Escritorio para no depender de la terminal.
+crear_atajo() {
+  [ -d "$HOME/Desktop" ] || return 0
+  [ -f "$ATAJO" ] && return 0
+  cat > "$ATAJO" <<ATAJO_EOF
+#!/bin/bash
+# Doble clic acá para abrir el menú de VoyAlCine.
+cd "$DIR" && ./cine
+ATAJO_EOF
+  chmod +x "$ATAJO" 2>/dev/null
+  ok "Te dejé un acceso en el Escritorio: VoyAlCine (doble clic para abrir esto)"
+}
+
+# ------------------------------------------------------------------ acciones ---
+
+activar() {
+  printf '\n  %sActivando…%s\n\n' "$D" "$R"
+  if ./install-daemon.sh >/dev/null 2>&1; then
+    ok "${B}Activado.${R} Ya está vigilando."
+    gris "Sigue andando si cerrás la terminal y si reiniciás la Mac."
+    gris "Ojo: mientras la Mac esté suspendida no puede revisar."
+  else
+    mal "No pude activarlo."
+    gris "Detalle:"
+    ./install-daemon.sh 2>&1 | sed 's/^/    /' | tail -12
+  fi
+}
+
+desactivar() {
+  printf '\n'
+  ./install-daemon.sh --uninstall >/dev/null 2>&1
+  ok "${B}Desactivado.${R} No te va a avisar más hasta que lo actives de nuevo."
+  gris "No se borró nada: tus ajustes y el historial siguen ahí."
+}
+
+estado() {
+  printf '\n'
+  if esta_activo; then
+    ok "Está ${VERDE}${B}ACTIVADO${R} y vigilando."
+    local pid; pid="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk -F'= ' '/^\tpid = /{print $2; exit}')"
+    [ -n "$pid" ] && gris "Proceso $pid · revisa cada $((INTERVAL / 60)) minutos"
+  else
+    aviso "Está ${B}DESACTIVADO${R}: no te va a avisar de nada."
+  fi
+  if [ -f "$LOG" ]; then
+    printf '\n  %sÚltimas líneas de lo que hizo:%s\n\n' "$B" "$R"
+    tail -6 "$LOG" | sed 's/^/    /'
+  fi
+}
+
+probar() {
+  printf '\n  %sVas a ver y escuchar lo mismo que cuando haya lugar de verdad.%s\n' "$D" "$R"
+  node watch.js --test-alert --alert "$ALERT" 2>&1 | sed 's/^/  /'
+  printf '\n'
+  if confirmar "¿Lo notaste?" s; then
+    ok "Perfecto, los avisos te van a llegar."
+  else
+    aviso "Subí el volumen y probá de nuevo."
+    gris "La ventana no depende de ningún permiso: si tampoco la viste,"
+    gris "fijate que no se haya abierto detrás de otra cosa."
+  fi
+}
+
+historial() {
+  printf '\n'
+  if [ ! -s hits.log ]; then
+    info "Todavía no encontró nada."
+    gris "Es lo normal al principio: sólo te avisa cuando algo cambia."
+    return
+  fi
+  printf '  %sÚltimas cosas que encontró:%s\n\n' "$B" "$R"
+  tail -15 hits.log | sed 's/^/    /'
+  printf '\n'
+  gris "Archivo completo: $DIR/hits.log"
+}
+
+ajustes() {
+  while :; do
+    titulo
+    printf '  %sAjustes%s\n\n' "$B" "$R"
+    printf '   %s1%s  Cambiar de película      %s(hoy: %s)%s\n' "$B" "$R" "$D" "${FILM_NAME:-$FILM}" "$R"
+    printf '   %s2%s  Cambiar los avisos       %s(hoy: %s)%s\n' "$B" "$R" "$D" "$(describir_avisos)" "$R"
+    printf '   %s3%s  Cada cuánto revisar      %s(hoy: cada %s min)%s\n' "$B" "$R" "$D" "$((INTERVAL / 60))" "$R"
+    printf '   %s4%s  Solo IMAX                %s(hoy: %s)%s\n' "$B" "$R" "$D" \
+      "$([ "$SOLO_IMAX" = 1 ] && echo sí || echo no)" "$R"
+    printf '   %s5%s  Cambiar de cine          %s(hoy: %s)%s\n' "$B" "$R" "$D" \
+      "${CINEMA_NAME:-todos}" "$R"
+    printf '   %s0%s  Volver\n' "$B" "$R"
+    printf '\n  > '
+    local a; read -r a || return
+    case "$a" in
+      1) if elegir_pelicula; then
+           elegir_cine "$(node peliculas.js info "$FILM" 2>/dev/null | sed -n 's/^CINEMAS=//p')"
+           guardar; reaplicar
+         fi ;;
+      2) cambiar_avisos ;;
+      3) cambiar_intervalo ;;
+      4) SOLO_IMAX=$([ "$SOLO_IMAX" = 1 ] && echo 0 || echo 1); guardar; reaplicar ;;
+      5) elegir_cine "$(node peliculas.js info "$FILM" 2>/dev/null | sed -n 's/^CINEMAS=//p')" \
+           && { guardar; reaplicar; } ;;
+      0|"") return ;;
+    esac
+  done
+}
+
+cambiar_avisos() {
+  printf '\n   %s1%s  Ventana + sonido (recomendado)\n' "$B" "$R"
+  printf '   %s2%s  Ventana + sonido + voz\n' "$B" "$R"
+  printf '   %s3%s  Ventana + sonido + abre el navegador\n' "$B" "$R"
+  printf '   %s4%s  Globo de notificación + sonido  %s(puede no verse, ver README)%s\n' "$B" "$R" "$D" "$R"
+  printf '\n  > '
+  local a; read -r a || return
+  case "$a" in
+    1) ALERT="bell,sound,dialog" ;;
+    2) ALERT="bell,sound,dialog,say" ;;
+    3) ALERT="bell,sound,dialog,open" ;;
+    4) ALERT="bell,sound,notify" ;;
+    *) return ;;
+  esac
+  guardar; reaplicar
+}
+
+cambiar_intervalo() {
+  printf '\n  ¿Cada cuántos minutos reviso? %s(Enter = 5)%s ' "$D" "$R"
+  local m; read -r m || return
+  m="${m:-5}"
+  if ! [[ "$m" =~ ^[0-9]+$ ]] || [ "$m" -lt 1 ]; then
+    aviso "Poné un número de minutos."; sleep 1; return
+  fi
+  if [ "$m" -lt 2 ]; then
+    aviso "Menos de 2 minutos carga el sitio sin ganar nada. Uso 2."
+    m=2
+  fi
+  INTERVAL=$((m * 60)); guardar; reaplicar
+}
+
+# Si estaba activo, los cambios sólo valen después de reinstalar el daemon:
+# los argumentos quedan grabados en el plist.
+reaplicar() {
+  if esta_activo; then
+    ./install-daemon.sh >/dev/null 2>&1 && ok "Listo, ya está andando con el cambio." \
+      || mal "Guardé el cambio pero no pude reiniciarlo. Probá desactivar y activar."
+  else
+    ok "Guardado."
+  fi
+  sleep 1
+}
+
+# -------------------------------------------------------------- autodestruir ---
+
+# Saca TODO: el arranque automático, los archivos que fue creando, el acceso del
+# Escritorio y (si querés) la carpeta entera. Lo único que no toca es Node,
+# porque no lo instalamos nosotros.
+borrar_todo() {
+  titulo
+  printf '  %s%sBorrar todo de esta computadora%s\n\n' "$B" "$ROJO" "$R"
+  info "Se va a eliminar:"
+  gris "· el arranque automático ($LABEL)"
+  gris "· los ajustes, el historial y los archivos de estado"
+  gris "· el acceso del Escritorio"
+  gris "· la carpeta $DIR (si me lo pedís)"
+  printf '\n'
+  info "NO se toca Node.js ni nada más de tu Mac."
+  printf '\n'
+  printf '  Escribí %sBORRAR%s para confirmar (cualquier otra cosa cancela): ' "$B" "$R"
+  local c; read -r c || return
+  if [ "$c" != "BORRAR" ]; then
+    printf '\n'; ok "Cancelado, no toqué nada."; pausa; return
+  fi
+
+  printf '\n'
+  ./install-daemon.sh --uninstall >/dev/null 2>&1
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  rm -f "$PLIST"
+  ok "Arranque automático eliminado."
+
+  rm -f "$ATAJO"
+  ok "Acceso del Escritorio eliminado."
+
+  rm -f "$DIR/state.json" "$DIR/known.json" "$DIR/hits.log" \
+        "$DIR/watch.out" "$DIR/config.json" "$CONF"
+  ok "Ajustes, historial y estado eliminados."
+
+  printf '\n'
+  if ! confirmar "¿Borro también la carpeta del programa?" s; then
+    printf '\n'
+    ok "Hecho. Quedó la carpeta $DIR sin nada corriendo."
+    gris "Podés borrarla a mano arrastrándola a la papelera."
+    echo; exit 0
+  fi
+
+  # No se puede borrar la carpeta desde un script que vive adentro: se pasa la
+  # última parte a un archivo temporal y se reemplaza este proceso.
+  local fin; fin="$(mktemp -t voyalcine-fin)"
+  cat > "$fin" <<FIN_EOF
+#!/bin/bash
+sleep 1
+rm -rf "$DIR"
+printf '\n  \033[32m✓\033[0m Listo: no queda nada de VoyAlCine en esta computadora.\n\n'
+rm -f "$fin"
+FIN_EOF
+  chmod +x "$fin"
+  printf '\n  %sBorrando la carpeta…%s\n' "$D" "$R"
+  cd "$HOME" || exit 0
+  exec bash "$fin"
+}
+
+# ------------------------------------------------- comandos no interactivos ---
+#
+# El menú necesita alguien que conteste. Estos comandos hacen lo mismo sin
+# preguntar nada, para un script o para un asistente que esté configurando esto
+# en nombre de alguien que no usa la terminal.
+
+# id<TAB>nombre de las películas que matcheen (o todas). Salida para leer con
+# un pipe: el progreso va a stderr.
+cmd_buscar() {
+  bajar_peliculas || return 1
+  if [ -n "${1:-}" ]; then
+    grep -i -- "$1" "$CACHE_PELIS" || { echo "sin resultados para: $1" >&2; return 1; }
+  else
+    cat "$CACHE_PELIS"
+  fi
+}
+
+# id<TAB>nombre de los cines donde se da esa película.
+cmd_cines() {
+  local film="${1:-}"
+  [ -z "$film" ] && { echo "uso: ./cine cines <film-id>" >&2; return 2; }
+  local linea
+  linea="$(node peliculas.js info "$film" 2>/dev/null | sed -n 's/^CINEMAS=//p')"
+  [ -z "$linea" ] && { echo "no pude leer los cines de la película $film" >&2; return 1; }
+  printf '%s\n' "$linea" | tr '|' '\n' | sed 's/^ *//; s/ *$//; s/^\([0-9]*\):/\1\t/' | grep -v '^$'
+}
+
+# Escribe ajustes.conf sin preguntar nada.
+#
+#   ./cine configurar --film 5875 --cine 14 --minutos 5 --activar
+#   ./cine configurar --film 5875 --imax --alerta bell,sound,dialog
+cmd_configurar() {
+  local film="" cine="" imax=0 minutos=5 alerta="bell,sound,dialog" activar_ya=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --film)     film="${2:-}"; shift 2 ;;
+      --cine)     cine="${2:-}"; shift 2 ;;
+      --imax)     imax=1; shift ;;
+      --minutos)  minutos="${2:-}"; shift 2 ;;
+      --alerta)   alerta="${2:-}"; shift 2 ;;
+      --activar)  activar_ya=1; shift ;;
+      *) echo "no entiendo la opción \"$1\"" >&2; return 2 ;;
+    esac
+  done
+
+  if [ -z "$film" ]; then
+    echo "falta --film <id>. Buscalo con: ./cine buscar <parte del nombre>" >&2
+    return 2
+  fi
+  if ! [[ "$minutos" =~ ^[0-9]+$ ]] || [ "$minutos" -lt 2 ]; then
+    echo "--minutos tiene que ser un número >= 2 (menos carga el sitio al vicio)" >&2
+    return 2
+  fi
+
+  # Se valida contra la API antes de guardar: un film id inventado dejaría el
+  # daemon corriendo para siempre sin encontrar nada y sin decir por qué.
+  local datos; datos="$(node peliculas.js info "$film" 2>/dev/null)"
+  local nombre; nombre="$(printf '%s\n' "$datos" | sed -n 's/^NAME=//p')"
+  if [ -z "$nombre" ]; then
+    echo "la película $film no existe o la API no responde" >&2
+    return 1
+  fi
+
+  FILM="$film"
+  FILM_NAME="$nombre"
+  SOLO_IMAX="$imax"
+  CINEMAS=""
+  CINEMA_NAME=""
+  if [ -n "$cine" ] && [ "$imax" != "1" ]; then
+    CINEMA_NAME="$(printf '%s\n' "$datos" | sed -n 's/^CINEMAS=//p' | tr '|' '\n' \
+      | sed 's/^ *//; s/ *$//' | awk -F: -v c="$cine" '$1 == c { print $2; exit }')"
+    if [ -z "$CINEMA_NAME" ]; then
+      echo "el cine $cine no proyecta \"$nombre\". Vé los cines con: ./cine cines $film" >&2
+      return 1
+    fi
+    CINEMAS="$cine"
+  fi
+  INTERVAL=$((minutos * 60))
+  ALERT="$alerta"
+  SEATS=0; ROWS=""; ZONE=""; PRICE=""
+  guardar
+
+  ok "Configurado: ${FILM_NAME} · $(describir_filtro)"
+  gris "Avisos: $(describir_avisos)"
+  crear_atajo
+  [ "$activar_ya" = "1" ] && activar
+  return 0
+}
+
+# --------------------------------------------------------------------- menú ---
+
+menu() {
+  while :; do
+    cargar
+    titulo
+    if esta_activo; then
+      printf '   %s%s● ACTIVADO%s   te aviso cuando haya lugar\n' "$VERDE" "$B" "$R"
+    else
+      printf '   %s○ DESACTIVADO%s   ahora mismo no te aviso de nada\n' "$D" "$R"
+    fi
+    printf '\n'
+    printf '   %sPelícula%s  %s\n' "$D" "$R" "${FILM_NAME:-película $FILM}"
+    printf '   %sFiltro%s    %s\n' "$D" "$R" "$(describir_filtro)"
+    printf '   %sAvisos%s    %s\n' "$D" "$R" "$(describir_avisos)"
+    printf '\n'
+    if esta_activo; then
+      printf '   %s1%s  Desactivar\n' "$B" "$R"
+    else
+      printf '   %s1%s  %sActivar%s  ← empezá por acá\n' "$B" "$R" "$B" "$R"
+    fi
+    printf '   %s2%s  Ver estado y actividad\n' "$B" "$R"
+    printf '   %s3%s  Probar los avisos\n' "$B" "$R"
+    printf '   %s4%s  Ver qué encontró\n' "$B" "$R"
+    printf '   %s5%s  Ajustes (película, avisos, frecuencia)\n' "$B" "$R"
+    printf '   %s9%s  %sBorrar todo de la computadora%s\n' "$B" "$R" "$ROJO" "$R"
+    printf '   %s0%s  Salir\n' "$B" "$R"
+    printf '\n  > '
+
+    local a; read -r a || exit 0
+    case "$a" in
+      1) if esta_activo; then desactivar; else activar; fi; pausa ;;
+      2) estado; pausa ;;
+      3) probar; pausa ;;
+      4) historial; pausa ;;
+      5) ajustes ;;
+      9) borrar_todo ;;
+      0) printf '\n'; esta_activo && gris "Sigue vigilando en segundo plano." || gris "Está desactivado."; echo; exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------------- main ---
+
+verificar_node
+cargar
+
+case "${1:-}" in
+  on|activar)      activar; echo ;;
+  off|desactivar)  desactivar; echo ;;
+  estado|status)   estado; echo ;;
+  probar|test)     probar; echo ;;
+  borrar-todo|nuke) borrar_todo ;;
+  ajustes|config)  [ -f "$CONF" ] || configurar; ajustes ;;
+  buscar)          shift; cmd_buscar "${1:-}" ;;
+  cines)           shift; cmd_cines "${1:-}" ;;
+  configurar)      shift; cmd_configurar "$@"; echo ;;
+  ""|menu)
+    # Primera vez: configurar antes de mostrar el menú.
+    if [ ! -f "$CONF" ]; then configurar || exit 0; cargar; pausa; fi
+    menu
+    ;;
+  -h|--help|ayuda)
+    titulo
+    info "./cine              abre el menú"
+    info "./cine on           activar"
+    info "./cine off          desactivar"
+    info "./cine estado       ver si está vigilando"
+    info "./cine probar       disparar un aviso de prueba"
+    info "./cine borrar-todo  sacar todo de la computadora"
+    echo
+    gris "Sin preguntas (para scripts o asistentes):"
+    info "./cine buscar odisea                      buscar película -> id"
+    info "./cine cines 5875                         cines de esa película -> id"
+    info "./cine configurar --film 5875 --cine 14 --activar"
+    echo
+    ;;
+  *)
+    mal "No entiendo \"$1\". Probá ./cine --help"
+    exit 1
+    ;;
+esac

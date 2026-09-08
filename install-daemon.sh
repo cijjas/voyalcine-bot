@@ -3,12 +3,15 @@
 # Instala voyalcine-bot como LaunchAgent: arranca solo al iniciar sesión,
 # se reinicia si se cae, y sigue vivo aunque cierres la terminal.
 #
-#   ./install-daemon.sh                 # instalar con los defaults
+#   ./install-daemon.sh                 # instalar
 #   ./install-daemon.sh --uninstall     # sacarlo
 #   ./install-daemon.sh --status        # ver si está corriendo
 #   ./install-daemon.sh --logs          # seguir el log en vivo
+#   ./install-daemon.sh --print-args    # ver con qué argumentos arrancaría
 #
-# Los argumentos del bot se editan en ARGS, abajo.
+# Normalmente no hace falta tocar esto: usá el menú (./cine), que escribe
+# ajustes.conf y llama a este script. Lo de abajo son los valores por defecto
+# para cuando ajustes.conf no existe.
 
 set -euo pipefail
 
@@ -18,9 +21,40 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 NODE="$(command -v node)"
 LOG="$DIR/watch.out"
 
+CONF="$DIR/ajustes.conf"
+
 # --- qué vigila y cada cuánto -------------------------------------------------
+# Defaults; ajustes.conf (que escribe ./cine) los sobreescribe.
 # 300s = 5 min. Ver el README para por qué no menos.
-ARGS=(--imax --seats 2 --rows 4-8 --zone middle --interval 300 --alert sound,notify,dialog --quiet)
+FILM=5875
+SOLO_IMAX=0
+FORMAT=""
+CINEMAS=""
+INTERVAL=300
+ALERT="bell,sound,dialog"
+SEATS=0            # 0 = no mirar butacas (no necesita sesión/cookie)
+ROWS=""
+ZONE=""
+PRICE=""
+# shellcheck source=/dev/null
+[ -f "$CONF" ] && . "$CONF"
+
+# Traduce los ajustes a los flags de watch.js. Un solo lugar, así el menú y el
+# daemon no pueden quedar desincronizados.
+build_args() {
+  ARGS=(--film "$FILM")
+  [ "${SOLO_IMAX:-0}" = "1" ] && ARGS+=(--imax)
+  [ -n "${FORMAT:-}" ]  && ARGS+=(--format "$FORMAT")
+  [ -n "${CINEMAS:-}" ] && ARGS+=(--cinema "$CINEMAS")
+  if [ "${SEATS:-0}" -gt 0 ]; then
+    ARGS+=(--seats "$SEATS")
+    [ -n "${ROWS:-}" ]  && ARGS+=(--rows "$ROWS")
+    [ -n "${ZONE:-}" ]  && ARGS+=(--zone "$ZONE")
+    [ -n "${PRICE:-}" ] && ARGS+=(--price "$PRICE")
+  fi
+  ARGS+=(--interval "${INTERVAL:-300}" --alert "${ALERT:-bell,sound,dialog}" --quiet)
+}
+build_args
 # ------------------------------------------------------------------------------
 
 case "${1:-}" in
@@ -43,6 +77,10 @@ case "${1:-}" in
     tail -f "$LOG"
     exit 0
     ;;
+  --print-args)
+    printf '%s\n' "${ARGS[@]}"
+    exit 0
+    ;;
 esac
 
 if [ -z "$NODE" ]; then
@@ -50,8 +88,25 @@ if [ -z "$NODE" ]; then
   exit 1
 fi
 
-if [ ! -f "$DIR/config.json" ]; then
-  echo "falta $DIR/config.json (lo necesita --seats). Ver el README." >&2
+# La ruta de node queda grabada en el plist. Si es de nvm, desaparece el día que
+# desinstalés esa versión y el daemon muere sin decir nada: launchd sólo lo
+# reintenta y falla. Avisar es más honesto que elegir otro node por atrás, que
+# podría ser más viejo que el que estás usando.
+case "$NODE" in
+  */.nvm/*)
+    echo "ojo: node viene de nvm ($NODE)."
+    echo "     Si borrás esa versión de node, el arranque automático deja de"
+    echo "     funcionar en silencio. Reinstalá el daemon después de cambiar de"
+    echo "     versión: ./cine off && ./cine on"
+    echo
+    ;;
+esac
+
+# Sólo el chequeo de butacas necesita sesión. Antes esto se exigía siempre, así
+# que la instalación fallaba aunque no estuvieras mirando butacas.
+if [ "${SEATS:-0}" -gt 0 ] && [ ! -f "$DIR/config.json" ]; then
+  echo "El chequeo de butacas (SEATS=$SEATS) necesita $DIR/config.json." >&2
+  echo "Poné SEATS=0 en ajustes.conf, o cargá la sesión desde ./cine → Ajustes." >&2
   exit 1
 fi
 
